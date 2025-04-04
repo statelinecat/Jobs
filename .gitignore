@@ -35,3 +35,5 @@ dist/
 htmlcov/
 .pytest_cache/
 config.py
+users.db
+vacancies.db
