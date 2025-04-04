@@ -1,4 +1,3 @@
-import requests
 import sqlite3
 import asyncio
 from telegram import Bot
@@ -7,13 +6,16 @@ import schedule
 import time
 import logging
 from datetime import datetime, timedelta
-from config import TOKEN, CHAT_ID
+from config import TOKEN
 import os
+import subprocess
+import sys
+import requests
 
 # Настройки
 SEARCH_HOURS = 240  # Ищем вакансии за последние N часов
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-CHECK_INTERVAL = 1  # Проверка каждые N минут
+CHECK_INTERVAL = 60  # Проверка каждые N минут
 
 # Основные регионы
 REGIONS = {
@@ -36,11 +38,12 @@ logging.basicConfig(
 
 
 def init_db():
-    """Инициализация базы данных с полем для опыта и формата работы"""
+    """Инициализация базы данных"""
     try:
-        conn = sqlite3.connect("vacancies.db")
-        cursor = conn.cursor()
-        cursor.execute("""
+        # База вакансий
+        conn_vac = sqlite3.connect("vacancies.db")
+        cursor_vac = conn_vac.cursor()
+        cursor_vac.execute("""
             CREATE TABLE IF NOT EXISTS vacancies (
                 id INTEGER PRIMARY KEY,
                 title TEXT,
@@ -50,15 +53,46 @@ def init_db():
                 experience TEXT,
                 work_format TEXT,
                 region TEXT,
-                published_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                published_at TIMESTAMP
             )
         """)
-        conn.commit()
+        conn_vac.commit()
+        conn_vac.close()
+
+        # База пользователей
+        conn_users = sqlite3.connect("users.db")
+        cursor_users = conn_users.cursor()
+        cursor_users.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn_users.commit()
+        conn_users.close()
+
+        logging.info("Базы данных инициализированы")
     except Exception as e:
         logging.error(f"Ошибка при инициализации БД: {e}")
-    finally:
-        conn.close()
+
+
+def get_db_connection(db_name):
+    """Безопасное подключение к SQLite"""
+    conn = None
+    attempts = 0
+    while attempts < 3:
+        try:
+            conn = sqlite3.connect(db_name, timeout=10)
+            conn.execute("PRAGMA busy_timeout = 10000")
+            return conn
+        except sqlite3.OperationalError as e:
+            logging.warning(f"Ошибка подключения к {db_name} (попытка {attempts + 1}): {e}")
+            time.sleep(1)
+            attempts += 1
+    raise sqlite3.OperationalError(f"Не удалось подключиться к {db_name} после 3 попыток")
 
 
 def get_hh_vacancies():
@@ -81,9 +115,9 @@ def get_hh_vacancies():
             response.raise_for_status()
             items = response.json().get("items", [])
             for item in items:
-                item['region'] = region_name  # Добавляем название региона
+                item['region'] = region_name
             all_vacancies.extend(items)
-            time.sleep(0.5)  # Задержка между запросами
+            time.sleep(0.5)
         except Exception as e:
             logging.error(f"Ошибка для региона {region_name}: {e}")
 
@@ -102,7 +136,6 @@ def parse_vacancies():
                 "%Y-%m-%dT%H:%M:%S%z"
             ).strftime('%d.%m.%Y %H:%M')
 
-            # Определяем формат работы
             schedule = item.get("schedule", {})
             work_format = "Не указан"
             if schedule:
@@ -153,111 +186,147 @@ def filter_new_vacancies(vacancies):
         return []
 
     new_vacancies = []
-    conn = sqlite3.connect("vacancies.db")
-    cursor = conn.cursor()
+    conn = None
 
-    # Проверяем существование таблицы
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='vacancies'")
-    if not cursor.fetchone():
-        init_db()
+    try:
+        conn = get_db_connection("vacancies.db")
+        cursor = conn.cursor()
 
-    for vacancy in vacancies:
-        try:
-            cursor.execute("SELECT 1 FROM vacancies WHERE link = ?", (vacancy["link"],))
-            if not cursor.fetchone():
-                new_vacancies.append(vacancy)
-                cursor.execute(
-                    """INSERT INTO vacancies 
-                    (title, link, company, salary, experience, work_format, region, published_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        vacancy["title"],
-                        vacancy["link"],
-                        vacancy["company"],
-                        vacancy["salary"],
-                        vacancy["experience"],
-                        vacancy["work_format"],
-                        vacancy["region"],
-                        vacancy["published_at"]
+        for vacancy in vacancies:
+            try:
+                cursor.execute("SELECT 1 FROM vacancies WHERE link = ?", (vacancy["link"],))
+                if not cursor.fetchone():
+                    new_vacancies.append(vacancy)
+                    cursor.execute(
+                        """INSERT INTO vacancies 
+                        (title, link, company, salary, experience, work_format, region, published_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            vacancy["title"],
+                            vacancy["link"],
+                            vacancy["company"],
+                            vacancy["salary"],
+                            vacancy["experience"],
+                            vacancy["work_format"],
+                            vacancy["region"],
+                            vacancy["published_at"]
+                        )
                     )
-                )
-                conn.commit()
-        except Exception as e:
-            logging.error(f"Ошибка проверки вакансии: {e}")
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"Ошибка проверки вакансии: {e}")
 
-    conn.close()
+    except Exception as e:
+        logging.error(f"Ошибка работы с БД вакансий: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     return new_vacancies
 
 
-async def async_send_telegram_alert(vacancies):
-    """Отправка уведомлений в Telegram"""
+async def send_telegram_alert(vacancies):
+    """Отправка уведомлений пользователям"""
     if not vacancies:
         return
 
     bot = Bot(token=TOKEN)
+    conn = None
 
-    for vacancy in vacancies:
-        try:
-            message = (
-                "🚀 *Новая вакансия!*\n"
-                f"📌 *{vacancy['title']}*\n"
-                f"🏢 *{vacancy['company']}*\n"
-                f"📍 *Регион:* {vacancy['region']}\n"
-                f"💰 *Зарплата:* {vacancy['salary']}\n"
-                f"🧑‍💻 *Опыт:* {vacancy['experience']}\n"
-                f"🏠 *Формат работы:* {vacancy['work_format']}\n"
-                f"⏳ *Опубликована:* {vacancy['published_at']}\n"
-                f"🔗 [Ссылка]({vacancy['link']})"
-            )
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=message,
-                parse_mode="Markdown",
-                disable_web_page_preview=True
-            )
-            await asyncio.sleep(1)
-        except TelegramError as e:
-            logging.error(f"Ошибка отправки в Telegram: {e}")
-
-
-def send_telegram_alert(vacancies):
-    """Синхронная обертка для отправки"""
-    asyncio.run(async_send_telegram_alert(vacancies))
-
-
-def job():
-    """Основная задача для schedule"""
     try:
-        logging.info("Запуск проверки вакансий")
+        conn = get_db_connection("users.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        users = cursor.fetchall()
+
+        if not users:
+            logging.info("Нет подписчиков для отправки уведомлений")
+            return
+
+        for user_id, in users:
+            for vacancy in vacancies:
+                try:
+                    message = (
+                        "🚀 *Новая вакансия!*\n"
+                        f"📌 *{vacancy['title']}*\n"
+                        f"🏢 *{vacancy['company']}*\n"
+                        f"📍 *Регион:* {vacancy['region']}\n"
+                        f"💰 *Зарплата:* {vacancy['salary']}\n"
+                        f"🧑‍💻 *Опыт:* {vacancy['experience']}\n"
+                        f"🏠 *Формат работы:* {vacancy['work_format']}\n"
+                        f"⏳ *Опубликована:* {vacancy['published_at']}\n"
+                        f"🔗 [Ссылка]({vacancy['link']})"
+                    )
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=message,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                    await asyncio.sleep(1)
+                except TelegramError as e:
+                    logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
+                    if "Forbidden: bot was blocked by the user" in str(e):
+                        try:
+                            with get_db_connection("users.db") as del_conn:
+                                del_conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+                                del_conn.commit()
+                                logging.info(f"Удален заблокировавший бота пользователь: {user_id}")
+                        except Exception as db_error:
+                            logging.error(f"Ошибка удаления пользователя: {db_error}")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке уведомлений: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+async def async_job():
+    """Асинхронная задача парсера"""
+    try:
+        logging.info("Запуск проверки вакансий...")
         vacancies = parse_vacancies()
         new_vacancies = filter_new_vacancies(vacancies)
 
         if new_vacancies:
-            send_telegram_alert(new_vacancies)
-            logging.info(f"Найдено новых вакансий: {len(new_vacancies)}")
+            logging.info(f"Найдено {len(new_vacancies)} новых вакансий")
+            await send_telegram_alert(new_vacancies)
         else:
             logging.info("Новых вакансий не найдено")
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
+        logging.error(f"Ошибка в async_job: {e}")
+
+
+def run_parser():
+    """Запуск парсера"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    schedule.every(CHECK_INTERVAL).minutes.do(
+        lambda: loop.run_until_complete(async_job())
+    )
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
 
 if __name__ == "__main__":
-    if not os.path.exists("vacancies.db"):
-        init_db()
+    init_db()
 
+    # Запуск бота в отдельном процессе
+    bot_process = subprocess.Popen([sys.executable, "bot.py"])
+
+    # Запуск парсера в основном процессе
     print("=" * 50)
-    print(f"🚀 Парсер вакансий HH.ru | Проверка каждые {CHECK_INTERVAL} мин")
-    print(f"⏳ Ищем вакансии за последние {SEARCH_HOURS} часов")
-    print(f"🌍 Регионы: {', '.join(REGIONS.values())}")
-    print("=" * 50 + "\n")
-
-    schedule.every(CHECK_INTERVAL).minutes.do(job)
+    print(f"🚀 Парсер вакансий | Проверка каждые {CHECK_INTERVAL} мин")
+    print(f"🤖 Бот запущен в фоновом режиме (PID: {bot_process.pid})")
+    print("=" * 50)
 
     try:
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+        run_parser()
     except KeyboardInterrupt:
+        bot_process.terminate()
         print("\n" + "=" * 50)
-        print("🛑 Парсер остановлен")
+        print("🛑 Парсер остановлен, бот завершен")
         print("=" * 50)
