@@ -101,7 +101,7 @@ def format_vacancy_message(vacancy):
 
 
 def get_new_vacancies(limit=50):
-    """Получение новых вакансий из базы"""
+    """Получение новых вакансий из базы с фильтром по удаленной работе"""
     try:
         with get_db_connection("vacancies.db") as conn:
             cursor = conn.cursor()
@@ -111,6 +111,7 @@ def get_new_vacancies(limit=50):
                 FROM vacancies v
                 LEFT JOIN sent_notifications s ON v.id = s.vacancy_id
                 WHERE s.vacancy_id IS NULL
+                AND v.work_format LIKE '%Удаленная%'
                 LIMIT ?
             """, (limit,))
             return cursor.fetchall()
